@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -111,14 +112,22 @@ def to_markdown(report: RunReport) -> str:
             f"- Category: `{r.category}` · vector: `{r.vector}` · {r.owasp}",
             f"- Success rate: {r.successes}/{r.trials}",
             "- Evidence:",
-            *[f"  - `{e.check}`: {e.detail}" for e in r.evidence],
+            *[f"  - `{e.check}`: {_visible(e.detail)}" for e in r.evidence],
             f"- Fix: {r.mitigation}",
+            *([f"- Sources: {_md_sources(r.sources)}"] if r.sources else []),
             "",
         ]
     errors = [r for r in report.results if r.outcome == Outcome.ERROR]
     if errors:
         lines += ["## Errors", ""] + [f"- {r.attack_id}: {r.error}" for r in errors]
     return "\n".join(lines) + "\n"
+
+
+def _md_sources(sources: list[dict]) -> str:
+    def esc(text: str) -> str:
+        return re.sub(r"([\\\[\]()])", r"\\\1", text)
+
+    return ", ".join(f"[{esc(s['title'])}](<{s['url']}>)" for s in sources)
 
 
 # ----------------------------------------------------------------- HTML
@@ -149,13 +158,36 @@ th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute
 .s-medium{background:var(--warn-bg);color:var(--warn)}.s-low{background:var(--line);color:var(--muted)}
 details{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:8px 0}
 summary{cursor:pointer;font-weight:600}
+a{color:var(--accent);overflow-wrap:anywhere}.src{padding-left:20px}
 pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);padding:10px;border-radius:8px;
 font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;max-height:260px;overflow:auto}
 """
 
 
+# Control characters (ESC, backspace, bidi overrides, ...) from attack payloads
+# are shown as visible code points instead of being passed to the browser.
+_CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def _visible(x) -> str:
+    def code(m: re.Match) -> str:
+        o = ord(m.group())
+        return f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}"
+
+    return _CTRL_RE.sub(code, str(x))
+
+
 def _e(x) -> str:
-    return html.escape(str(x))
+    return html.escape(_visible(x))
+
+
+def _sources_html(sources: list[dict]) -> str:
+    links = [
+        f"<li><a href='{_e(s['url'])}' rel='noopener noreferrer'>{_e(s['title'])}</a></li>"
+        for s in sources
+        if str(s.get("url", "")).startswith(("https://", "http://"))
+    ]
+    return f"<p><b>Sources</b></p><ul class='src'>{''.join(links)}</ul>" if links else ""
 
 
 def _pill(cls: str, text: str) -> str:
@@ -208,6 +240,7 @@ def to_html(report: RunReport) -> str:
             f"<p class='muted'>{_e(r.category)} · vector <code>{_e(r.vector)}</code> · {_e(r.owasp)}</p>"
             f"<p><b>Evidence</b></p><ul>{ev}</ul>"
             f"<p><b>Fix:</b> {_e(r.mitigation)}</p>"
+            f"{_sources_html(r.sources)}"
             f"<p><b>Tool calls</b></p><pre>{_e(calls)}</pre>"
             f"<p><b>Response</b></p><pre>{_e(r.response_excerpt)}</pre></details>"
         )

@@ -83,6 +83,7 @@ class AttackResult:
     error: str = ""
     owasp: str = ""
     mitigation: str = ""
+    sources: list[dict[str, str]] = field(default_factory=list)  # [{"title", "url"}]
 
     @property
     def success_rate(self) -> float:

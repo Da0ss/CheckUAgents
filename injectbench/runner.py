@@ -41,6 +41,16 @@ def new_marker(seed: str | None = None, attack_id: str = "", trial: int = 0) -> 
     return "PWNED-" + f"{rng.getrandbits(24):06X}"
 
 
+def make_toolbox(attack: Attack, payload: str) -> ToolBox:
+    """Place the rendered payload where the attack's vector says."""
+    tools = ToolBox()
+    if attack.target_tool:
+        tools.poison_description(attack.target_tool, payload)
+    elif attack.vector != "user":
+        tools.payload, tools.payload_tool = payload, attack.vector
+    return tools
+
+
 @dataclass
 class RunReport:
     agent: str
@@ -67,7 +77,7 @@ class Runner:
         for trial in range(self.trials):
             marker = new_marker(self.seed, attack.id, trial)
             payload = attack.render(marker, self.env.attacker_email, self.env.attacker_domain)
-            tools = ToolBox(payload=payload if attack.vector != "user" else "", payload_tool=attack.vector)
+            tools = make_toolbox(attack, payload)
             try:
                 resp = self.agent.run(self.env.system_prompt, attack.user_message(payload), tools)
             except Exception as exc:  # adapter or network failure: report, keep going
@@ -106,6 +116,7 @@ class Runner:
             error=error,
             owasp=attack.owasp,
             mitigation=attack.mitigation,
+            sources=[{"title": t, "url": u} for t, u in attack.sources],
         )
         if self.progress:
             self.progress(result)
