@@ -5,7 +5,8 @@ Layers:
   tool_vetting    - replace suspicious tool descriptions before the agent sees them
   output_scanner  - remove suspicious lines from tool output (quarantine)
   spotlight       - mark tool output as untrusted data (helps LLM agents)
-  tool_policy     - block sensitive tool calls that the user did not ask for
+  tool_policy     - block sensitive tool calls that the user did not ask for, and
+                    URL fetches to hosts that neither the user nor the allowlist named
   output_filter   - redact secrets (also obfuscated forms), attacker URLs and
                     terminal escape sequences from the final answer
 """
@@ -139,12 +140,56 @@ _INTENT = {
     "write_file": r"\b(write|save|create|edit|update)\b",
 }
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+# A bare host with a path or a "www." prefix ("open acme.example/pricing"). A lone
+# "notes.md" is a file name, and the domain of an e-mail address is not a fetch target.
+_HOST_RE = re.compile(
+    r"(?<![@\w.:/-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9])(?=/)"
+    r"|(?<![@\w.:/-])(www\.(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*[a-z0-9])\b",
+    re.I,
+)
 
 
-def tool_policy(user_message: str):
-    """Build a gate: allow a sensitive tool only if the user asked for that action."""
+def url_args(name: str) -> list[str]:
+    """Argument names that take a URL, read from the tool's input schema."""
+    props = TOOL_SPECS.get(name, {}).get("input_schema", {}).get("properties", {})
+    return [k for k in props if k in ("url", "uri") or k.endswith("_url")]
+
+
+def named_hosts(text: str) -> set[str]:
+    """Host names the user wrote in a message: URL hosts and bare host names."""
+    hosts = set()
+    for m in re.finditer(r"\b[a-z][a-z0-9+.-]*://[^\s<>\"')]+", text, re.I):
+        hosts.add((urlparse(m.group()).hostname or "").lower())
+    for m in _HOST_RE.finditer(_EMAIL_RE.sub(" ", text)):
+        hosts.add((m.group(1) or m.group(2)).lower())
+    hosts.discard("")
+    return hosts
+
+
+def _host_allowed(host: str, user_hosts: set[str], allowed_domains) -> bool:
+    if not host:
+        return False
+    return host in user_hosts or any(host == d or host.endswith("." + d) for d in allowed_domains)
+
+
+def tool_policy(user_message: str, allowed_domains=()):
+    """Build a gate.
+
+    - A sensitive tool runs only if the user asked for that action
+      (and an e-mail only goes to an address the user named).
+    - A tool that takes a URL (egress) only reaches a host that the user named
+      in the message or that is in `allowed_domains`.
+    """
+    user_hosts = named_hosts(user_message)
+    allowed = {d.lower() for d in allowed_domains}
 
     def gate(name: str, args: dict) -> str:
+        for arg in url_args(name):
+            url = str(args.get(arg, ""))
+            host = (urlparse(url).hostname or "").lower() if "://" in url else ""
+            if not _host_allowed(host, user_hosts, allowed):
+                return (f"egress to host '{host or url[:60]}' is not allowed: the user did not name it "
+                        f"and it is not in allowed_domains")
         if name not in SENSITIVE_TOOLS:
             return ""
         if not re.search(_INTENT[name], user_message, re.I):
@@ -240,7 +285,7 @@ class GuardedAgent:
                 text = f"<untrusted_data source=\"{name}\">\n{text}\n</untrusted_data>"
             return text
 
-        gate = tool_policy(user_message) if "tool_policy" in self.layers else None
+        gate = tool_policy(user_message, self.allowed_domains) if "tool_policy" in self.layers else None
         guarded = GuardedToolBox(tools, on_result=on_result, gate=gate)
         vetted = vet_tools(guarded) if "tool_vetting" in self.layers else []
         if "spotlight" in self.layers:
