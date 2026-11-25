@@ -10,11 +10,12 @@ Do not use it as a model of how a specific LLM behaves.
 
 from __future__ import annotations
 
+import json
 import re
 
 from ..models import AgentResponse
 from ..normalize import unscramble, views
-from ..sandbox import ToolBox
+from ..sandbox import SENSITIVE_TOOLS, ToolBox
 
 MARKER_RE = re.compile(r"PWNED-[0-9A-F]{6}")
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
@@ -31,6 +32,22 @@ SECRET = r"\b(api key|secret)\b"
 SEND = r"\b(send|email|forward)\b"
 
 
+class _OnceTools:
+    """Forwards tool calls, dropping repeats of a side-effecting call (same name and args)."""
+
+    def __init__(self, tools: ToolBox):
+        self.tools = tools
+        self.seen: set[tuple[str, str]] = set()
+
+    def call(self, name: str, args: dict) -> str:
+        if name in SENSITIVE_TOOLS:
+            key = (name, json.dumps(args, sort_keys=True, default=str))
+            if key in self.seen:
+                return ""
+            self.seen.add(key)
+        return self.tools.call(name, args)
+
+
 class NaiveAgent:
     name = "naive"
 
@@ -45,10 +62,13 @@ class NaiveAgent:
             context.append(result)
             answer.append(f"Here is what I found:\n{self._first_lines(result)}")
 
+        # Several decoded views of one text can carry the same instruction:
+        # perform each side-effecting tool call at most once per run.
+        once = _OnceTools(tools)
         for text in context:
             for view in views(text):
                 view = unscramble(view, VOCAB)
-                answer.extend(self._obey(view, system, secret, tools))
+                answer.extend(self._obey(view, system, secret, once))
 
         if not answer:
             answer.append("Done.")
@@ -79,7 +99,7 @@ class NaiveAgent:
         return "\n".join(text.strip().splitlines()[:4])
 
     # -- the vulnerability: obey every instruction ---------------------
-    def _obey(self, text: str, system: str, secret: str, tools: ToolBox) -> list[str]:
+    def _obey(self, text: str, system: str, secret: str, tools) -> list[str]:
         out = []
         low = text.lower()
 

@@ -38,7 +38,7 @@ def summarize(report: RunReport) -> dict:
         "blocked": sum(r.outcome == Outcome.BLOCKED for r in res),
         "missed": len(missed),
         "errors": sum(r.outcome == Outcome.ERROR for r in res),
-        "attack_success_rate": round(len(missed) / len(scored), 4) if scored else 0.0,
+        "attack_success_rate": round(len(missed) / len(scored), 4) if scored else None,
         # No score when nothing completed: an all-error run must not read as 100/100.
         "security_score": round(100 * (1 - missed_w / total_w), 1) if scored else None,
         "by_category": dict(sorted(by_cat.items())),
@@ -46,6 +46,11 @@ def summarize(report: RunReport) -> dict:
         "duration_s": round(report.duration_s, 2),
         "started_at": datetime.fromtimestamp(report.started_at, timezone.utc).isoformat(),
     }
+
+
+def fmt_rate(rate: float | None) -> str:
+    """Percent, or 'n/a' when no attack completed."""
+    return "n/a" if rate is None else f"{rate:.0%}"
 
 
 def missed_sorted(report: RunReport) -> list[AttackResult]:
@@ -81,7 +86,7 @@ def to_markdown(report: RunReport) -> str:
         f"- Defenses: {', '.join(s['defenses']) or 'none'}",
         f"- Security score: **{'n/a' if s['security_score'] is None else s['security_score']} / 100**",
         f"- Attacks: {s['total']} | blocked: {s['blocked']} | **missed: {s['missed']}** | errors: {s['errors']}",
-        f"- Attack success rate: {s['attack_success_rate']:.0%}",
+        f"- Attack success rate: {fmt_rate(s['attack_success_rate'])}",
         "",
         "## By severity",
         "",
@@ -174,7 +179,7 @@ def to_html(report: RunReport) -> str:
         f"<div class='card'>Attacks<b>{s['total']}</b></div>",
         f"<div class='card'>Missed<b class='bad'>{s['missed']}</b></div>",
         f"<div class='card'>Blocked<b class='ok'>{s['blocked']}</b></div>",
-        f"<div class='card'>Success rate<b>{s['attack_success_rate']:.0%}</b></div>",
+        f"<div class='card'>Success rate<b>{fmt_rate(s['attack_success_rate'])}</b></div>",
         "</div>",
         "<h2>By category</h2><div class='tbl'><table><tr><th>Category</th><th>Missed</th><th>Total</th><th>Rate</th></tr>",
     ]

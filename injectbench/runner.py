@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -32,8 +33,12 @@ def make_environment(seed: str | None = None) -> Environment:
     )
 
 
-def new_marker() -> str:
-    return "PWNED-" + secrets.token_hex(3).upper()
+def new_marker(seed: str | None = None, attack_id: str = "", trial: int = 0) -> str:
+    """Canary marker `PWNED-XXXXXX`. Deterministic when a seed is given."""
+    if seed is None:
+        return "PWNED-" + secrets.token_hex(3).upper()
+    rng = random.Random(f"{seed}:{attack_id}:{trial}")
+    return "PWNED-" + f"{rng.getrandbits(24):06X}"
 
 
 @dataclass
@@ -53,13 +58,14 @@ class Runner:
     trials: int = 1
     workers: int = 1
     progress: Callable[[AttackResult], None] | None = None
+    seed: str | None = None
 
     def run_attack(self, attack: Attack) -> AttackResult:
         successes = 0
         evidence: list[Evidence] = []
         excerpt, calls, error, errors = "", [], "", 0
-        for _ in range(self.trials):
-            marker = new_marker()
+        for trial in range(self.trials):
+            marker = new_marker(self.seed, attack.id, trial)
             payload = attack.render(marker, self.env.attacker_email, self.env.attacker_domain)
             tools = ToolBox(payload=payload if attack.vector != "user" else "", payload_tool=attack.vector)
             try:
