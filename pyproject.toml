@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "injectbench"
+version = "0.1.0"
+description = "Prompt injection test suite for AI agents: attack library, checks, defenses and reports"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+claude = ["anthropic"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+injectbench = "injectbench.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["injectbench*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
