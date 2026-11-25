@@ -7,6 +7,9 @@ import importlib
 import os
 import sys
 
+# Per-agent --model defaults. Neither module imports an optional SDK at load time.
+from .agents.claude import DEFAULT_MODEL as CLAUDE_DEFAULT_MODEL
+from .agents.openrouter import DEFAULT_MODEL as OPENROUTER_DEFAULT_MODEL
 from .attacks import categories, get_attacks
 from .defenses import ALL_LAYERS, GuardedAgent
 from .models import Outcome, Severity
@@ -19,6 +22,16 @@ FORMATS = ("json", "md", "html")
 
 class AgentLoadError(Exception):
     """The requested agent could not be created (missing module, SDK, ...)."""
+
+
+def non_negative_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid float value: {text!r}") from None
+    if not value >= 0 or value == float("inf"):
+        raise argparse.ArgumentTypeError(f"must be a finite number >= 0, got {text}")
+    return value
 
 
 def positive_int(text: str) -> int:
@@ -84,7 +97,13 @@ def _make_agent(args):
     elif args.agent == "claude":
         from .agents.claude import ClaudeAgent
 
-        agent = ClaudeAgent(model=args.model, effort=args.effort, use_fallbacks=not args.no_fallbacks)
+        agent = ClaudeAgent(model=args.model or CLAUDE_DEFAULT_MODEL, effort=args.effort,
+                            use_fallbacks=not args.no_fallbacks)
+    elif args.agent == "openrouter":
+        from .agents.openrouter import OpenRouterAgent
+
+        agent = OpenRouterAgent(model=args.model or OPENROUTER_DEFAULT_MODEL, reasoning=args.reasoning,
+                                min_interval=args.min_interval)
     elif args.agent == "http":
         if not args.url:
             sys.exit("--url is required for --agent http")
@@ -160,10 +179,15 @@ def main(argv=None) -> int:
     pl.set_defaults(func=cmd_list)
 
     pr = sub.add_parser("run", help="run attacks against an agent")
-    pr.add_argument("--agent", default="naive", help="naive | claude | http | module:factory")
-    pr.add_argument("--model", default="claude-opus-5-5", help="model for --agent claude")
+    pr.add_argument("--agent", default="naive", help="naive | claude | openrouter | http | module:factory")
+    pr.add_argument("--model", default=None,
+                    help=f"model for --agent claude (default {CLAUDE_DEFAULT_MODEL}) "
+                         f"or openrouter (default {OPENROUTER_DEFAULT_MODEL})")
     pr.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
     pr.add_argument("--no-fallbacks", action="store_true", help="disable server-side refusal fallbacks")
+    pr.add_argument("--reasoning", action="store_true", help="enable reasoning for --agent openrouter")
+    pr.add_argument("--min-interval", type=non_negative_float, default=0.0,
+                    help="min seconds between requests for --agent openrouter (free-model rate limits)")
     pr.add_argument("--url", help="endpoint for --agent http")
     pr.add_argument("--defenses", help=f"'all' or a comma list of: {','.join(ALL_LAYERS)}")
     pr.add_argument("--category", action="append", help="filter by category (repeatable)")

@@ -573,3 +573,213 @@ def test_html_report_neutralizes_control_characters():
     report = Runner(NaiveAgent(), ENV).run(get_attacks(ids=["DI-021", "IF-010"]))
     html = to_html(report)
     assert "\x1b" not in html and "\u202e" not in html and "\\x1b" in html
+
+
+# ------------------------------------------------- OpenRouter adapter (fake transport, no network)
+from injectbench.agents.openrouter import (  # noqa: E402
+    API_URL as OR_URL,
+    DEFAULT_MODEL as OR_DEFAULT_MODEL,
+    OpenRouterAgent,
+    OpenRouterError,
+    to_openai_tools,
+)
+
+
+class FakeTransport:
+    """Replays scripted (status, headers, body) replies and records every request."""
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.requests = []
+
+    def __call__(self, url, headers, body):
+        self.requests.append({"url": url, "headers": headers, "body": json.loads(body)})
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        status, headers_out, data = reply
+        return status, headers_out, json.dumps(data).encode() if not isinstance(data, bytes) else data
+
+
+def _or_ok(message, finish="stop", usage=None):
+    data = {"model": "served/m", "choices": [{"finish_reason": finish, "message": {"role": "assistant", **message}}]}
+    if usage:
+        data["usage"] = usage
+    return 200, {}, data
+
+
+def _or_tool_turn(name="read_inbox", args="{}", call_id="call_1", **extra):
+    return _or_ok({"content": None, "tool_calls": [
+        {"id": call_id, "type": "function", "function": {"name": name, "arguments": args}}], **extra},
+        finish="tool_calls", usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12})
+
+
+def _or_agent(transport, **kw):
+    sleeps = []
+    agent = OpenRouterAgent(api_key="sk-test", post=transport, sleep=sleeps.append, **kw)
+    return agent, sleeps
+
+
+def test_openai_tool_spec_conversion():
+    specs = ToolBox().specs
+    converted = to_openai_tools(specs)
+    assert len(converted) == len(TOOL_SPECS)
+    first = converted[0]
+    assert first["type"] == "function"
+    assert set(first["function"]) == {"name", "description", "parameters"}
+    by_name = {t["function"]["name"]: t["function"] for t in converted}
+    assert by_name["send_email"]["parameters"] == TOOL_SPECS["send_email"]["input_schema"]
+    assert by_name["send_email"]["description"] == TOOL_SPECS["send_email"]["description"]
+
+
+def test_openrouter_tool_loop_sends_tool_result_back():
+    t = FakeTransport(_or_tool_turn(), _or_ok({"content": f"Summary. Key: {ENV.canary}"},
+                                              usage={"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35}))
+    agent, _ = _or_agent(t)
+    assert agent.name == f"openrouter:{OR_DEFAULT_MODEL}"
+    report = Runner(agent, ENV).run(get_attacks(ids=["IE-001"]))
+    r = report.results[0]
+    assert r.outcome == Outcome.MISSED and r.tool_calls[0]["name"] == "read_inbox"
+    first, second = t.requests
+    assert first["url"] == OR_URL == "https://openrouter.ai/api/v1/chat/completions"
+    assert first["headers"]["Authorization"] == "Bearer sk-test"
+    assert first["headers"]["Content-Type"] == "application/json"
+    assert first["body"]["model"] == OR_DEFAULT_MODEL and "reasoning" not in first["body"]
+    assert [m["role"] for m in first["body"]["messages"]] == ["system", "user"]
+    assert first["body"]["tools"][0]["type"] == "function"
+    msgs = second["body"]["messages"]
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool"]
+    assert msgs[2]["tool_calls"][0]["id"] == "call_1"
+    assert msgs[3]["tool_call_id"] == "call_1" and "attacker@evil.example" in msgs[3]["content"]
+
+
+def test_openrouter_meta_aggregates_usage_and_collects_text():
+    t = FakeTransport(_or_tool_turn(content="Let me check."), _or_ok({"content": "Done."},
+                      usage={"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35}))
+    agent, _ = _or_agent(t, model="some/model")
+    resp = agent.run("sys", "hi", ToolBox())
+    assert resp.text == "Let me check.\nDone."
+    assert resp.meta["model"] == "some/model" and agent.name == "openrouter:some/model"
+    assert resp.meta["usage"] == {"prompt_tokens": 40, "completion_tokens": 7, "total_tokens": 47}
+
+
+def test_openrouter_reasoning_details_preserved_and_flag_sent():
+    details = [{"type": "reasoning.encrypted", "data": "opaque==", "id": "r1", "format": "x", "index": 0}]
+    t = FakeTransport(_or_tool_turn(reasoning_details=details), _or_ok({"content": "ok"}))
+    agent, _ = _or_agent(t, reasoning=True)
+    agent.run("sys", "hi", ToolBox())
+    assert t.requests[0]["body"]["reasoning"] == {"enabled": True}
+    assistant = t.requests[1]["body"]["messages"][2]
+    assert assistant["reasoning_details"] == details
+
+
+def test_openrouter_bad_tool_arguments_pass_empty_dict_and_are_noted():
+    t = FakeTransport(_or_tool_turn(name="read_file", args="{not json"), _or_ok({"content": "ok"}))
+    agent, _ = _or_agent(t)
+    tools = ToolBox()
+    resp = agent.run("sys", "hi", tools)
+    assert tools.trace[0].name == "read_file" and tools.trace[0].args == {}
+    assert "bad JSON" in resp.meta["notes"][0]
+
+
+def test_openrouter_429_retries_and_honors_retry_after():
+    t = FakeTransport((429, {"Retry-After": "7"}, {"error": {"message": "rate limited"}}),
+                      (503, {}, b"busy"), _or_ok({"content": "hello"}))
+    agent, sleeps = _or_agent(t)
+    resp = agent.run("sys", "hi", ToolBox())
+    assert resp.text == "hello" and len(t.requests) == 3
+    assert sleeps == [7.0, 4]  # Retry-After first, then the backoff schedule
+
+
+def test_openrouter_connection_errors_retry_then_raise():
+    t = FakeTransport(*[ConnectionError("reset")] * 6)
+    agent, sleeps = _or_agent(t)
+    with pytest.raises(OpenRouterError, match="after 6 attempts"):
+        agent.run("sys", "hi", ToolBox())
+    assert sleeps == [2, 4, 8, 16, 30]
+
+
+def test_openrouter_client_error_is_not_retried():
+    t = FakeTransport((401, {}, {"error": {"message": "bad key"}}))
+    agent, sleeps = _or_agent(t)
+    with pytest.raises(OpenRouterError, match="401"):
+        agent.run("sys", "hi", ToolBox())
+    assert sleeps == []
+
+
+def test_openrouter_error_object_in_200_raises_and_runner_records_error():
+    t = FakeTransport((200, {}, {"error": {"code": 502, "message": "provider down"}}))
+    agent, _ = _or_agent(t)
+    report = Runner(agent, ENV).run(get_attacks(ids=["DI-001"]))
+    r = report.results[0]
+    assert r.outcome == Outcome.ERROR and "provider down" in r.error
+
+
+def test_openrouter_content_filter_is_refused_and_blocked():
+    t = FakeTransport(_or_ok({"content": ""}, finish="content_filter"))
+    agent, _ = _or_agent(t)
+    report = Runner(agent, ENV).run(get_attacks(ids=["DI-002"]))
+    assert report.results[0].outcome == Outcome.BLOCKED
+    t2 = FakeTransport(_or_ok({"content": None}, finish="content_filter"))
+    assert _or_agent(t2)[0].run("sys", "hi", ToolBox()).refused is True
+
+
+def test_openrouter_missing_key_is_clear_error(monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+        OpenRouterAgent(post=FakeTransport())
+    assert main(["run", "--agent", "openrouter", "--out", str(tmp_path)]) == 2
+    assert "OPENROUTER_API_KEY" in capsys.readouterr().err
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-env")
+    t = FakeTransport(_or_ok({"content": "x"}))
+    OpenRouterAgent(post=t).run("s", "u", ToolBox())
+    assert t.requests[0]["headers"]["Authorization"] == "Bearer sk-env"
+
+
+def test_openrouter_min_interval_spaces_requests():
+    now = [100.0]
+    t = FakeTransport(_or_tool_turn(), _or_ok({"content": "ok"}))
+    sleeps = []
+
+    def sleep(s):
+        sleeps.append(s)
+        now[0] += s
+
+    agent = OpenRouterAgent(api_key="k", post=t, sleep=sleep, clock=lambda: now[0], min_interval=3)
+    agent.run("s", "u", ToolBox())
+    assert sleeps == [3.0]
+
+
+def test_cli_openrouter_model_defaults_per_agent(monkeypatch, tmp_path):
+    import injectbench.agents.claude as claude_mod
+    import injectbench.agents.openrouter as or_mod
+
+    seen = {}
+
+    def capture(kind):
+        def make(**kw):
+            seen[kind] = kw
+            return NaiveAgent()
+        return make
+
+    monkeypatch.setattr(or_mod, "OpenRouterAgent", capture("or"))
+    monkeypatch.setattr(claude_mod, "ClaudeAgent", capture("claude"))
+    base = ["run", "--seed", "x", "--id", "DI-001", "--out", str(tmp_path), "--format", "json"]
+    assert main(base + ["--agent", "openrouter", "--reasoning", "--min-interval", "1.5"]) == 0
+    assert seen["or"] == {"model": OR_DEFAULT_MODEL, "reasoning": True, "min_interval": 1.5}
+    assert main(base + ["--agent", "openrouter", "--model", "x/y"]) == 0
+    assert seen["or"]["model"] == "x/y"
+    assert main(base + ["--agent", "claude"]) == 0
+    assert seen["claude"]["model"] == "claude-opus-5-5"
+
+
+def test_openrouter_exported_lazily():
+    import injectbench.agents as agents
+
+    assert agents.OpenRouterAgent is OpenRouterAgent
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "abc"])
+def test_cli_min_interval_must_be_finite_non_negative(tmp_path, capsys, value):
+    err = _cli_error(capsys, ["run", "--out", str(tmp_path), "--agent", "openrouter", "--min-interval", value])
+    assert "--min-interval" in err
