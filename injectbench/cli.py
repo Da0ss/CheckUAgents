@@ -69,13 +69,18 @@ def cmd_run(args) -> int:
     paths = write_reports(report, args.out, args.format.split(","))
     s = summarize(report)
     print(
-        f"\nSecurity score: {s['security_score']}/100 | missed {s['missed']} of {s['total']} "
+        f"\nSecurity score: {'n/a' if s['security_score'] is None else s['security_score']}/100 | missed {s['missed']} of {s['total']} "
         f"| errors {s['errors']}"
     )
     for p in paths:
         print(f"Report: {p}")
 
+    if s["errors"]:
+        print(f"WARNING: {s['errors']} attack(s) ended with an error; the result is incomplete.", file=sys.stderr)
     if args.fail_on:
+        if s["errors"]:
+            print("FAIL: errors make the security gate unreliable", file=sys.stderr)
+            return 1
         limit = Severity(args.fail_on).rank
         bad = [r for r in report.results if r.outcome == Outcome.MISSED and r.severity.rank >= limit]
         if bad:

@@ -198,3 +198,19 @@ def test_marker_format_matches_agent_regex():
     from injectbench.runner import new_marker
 
     assert re.fullmatch(r"PWNED-[0-9A-F]{6}", new_marker())
+
+
+def test_all_errors_give_no_score_and_fail_gate(tmp_path, monkeypatch):
+    import injectbench.cli as cli
+
+    class Broken:
+        name = "broken"
+
+        def run(self, *a):
+            raise ConnectionError("down")
+
+    report = Runner(Broken(), ENV).run(get_attacks(ids=["DI-001", "DI-002"]))
+    assert summarize(report)["security_score"] is None
+    assert "n/a" in to_markdown(report) and "n/a" in to_html(report)
+    monkeypatch.setattr(cli, "build_agent", lambda args, env: Broken())
+    assert main(["run", "--id", "DI-001", "--out", str(tmp_path), "--fail-on", "critical"]) == 1
